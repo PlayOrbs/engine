@@ -1,0 +1,99 @@
+{
+  "name": "@orbs/engine",
+  "version": "1.0.0",
+  "description": "Deterministic physics and game engine for Orb Battle",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.ts",
+  "exports": {
+    ".": {
+      "types": "./index.ts",
+      "default": "./index.js"
+    },
+    "./core": {
+      "types": "./src/core/index.ts",
+      "default": "./src/core/index.js"
+    },
+    "./utils": {
+      "types": "./src/utils/index.ts",
+      "default": "./src/utils/index.js"
+    },
+    "./economics": {
+      "types": "./src/economics/index.ts",
+      "default": "./src/economics/index.js"
+    },
+    "./sim": {
+      "types": "./src/core/v1/sim.ts",
+      "default": "./src/core/v1/sim.js"
+    },
+    "./types": {
+      "types": "./src/core/v1/types.ts",
+      "default": "./src/core/v1/types.js"
+    },
+    "./physics": {
+      "types": "./src/core/v1/physics.ts",
+      "default": "./src/core/v1/physics.js"
+    },
+    "./scoring": {
+      "types": "./src/economics/scoring.ts",
+      "default": "./src/economics/scoring.js"
+    },
+    "./rng": {
+      "types": "./src/utils/rng.ts",
+      "default": "./src/utils/rng.js"
+    },
+    "./seeds": {
+      "types": "./src/utils/seeds.ts",
+      "default": "./src/utils/seeds.js"
+    },
+    "./tethers": {
+      "types": "./src/core/v1/tethers.ts",
+      "default": "./src/core/v1/tethers.js"
+    },
+    "./determinism": {
+      "types": "./src/core/v1/determinism.ts",
+      "default": "./src/core/v1/determinism.js"
+    },
+    "./transcript": {
+      "types": "./src/utils/transcript.ts",
+      "default": "./src/utils/transcript.js"
+    },
+    "./runner": {
+      "types": "./src/core/v2/engine_runner.ts",
+      "default": "./src/core/v2/engine_runner.js"
+    }
+  },
+  "scripts": {
+    "test": "vitest",
+    "test:run": "vitest run",
+    "lint": "eslint . --ext ts --report-unused-disable-directives --max-warnings 0",
+    "verify": "bun scripts/verify_round.ts"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.8.0"
+  },
+  "devDependencies": {
+    "@dfinity/agent": "^3.4.3",
+    "@dfinity/candid": "^3.4.3",
+    "@dfinity/principal": "^3.4.3",
+    "bs58": "^6.0.0",
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "eslint": "^8.55.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.2.4"
+  },
+  "keywords": [
+    "game-engine",
+    "physics",
+    "deterministic",
+    "orb-battle"
+  ],
+  "author": "pxr64",
+  "license": "BSL-1.1",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:PlayOrbs/engine.git"
+  }
+}

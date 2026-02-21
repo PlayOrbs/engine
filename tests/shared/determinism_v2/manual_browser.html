@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>V2 Determinism — Browser Harness</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, 'SF Mono', 'Fira Code', monospace; background: #0d1117; color: #c9d1d9; padding: 16px; }
+    h1 { font-size: 18px; color: #58a6ff; margin-bottom: 16px; }
+    .scenario { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+    .scenario-name { font-size: 15px; font-weight: bold; color: #f0f6fc; margin-bottom: 8px; }
+    .row { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; font-size: 13px; }
+    .label { color: #8b949e; font-size: 12px; }
+    .hash { font-size: 12px; word-break: break-all; line-height: 1.4; font-family: 'SF Mono', 'Fira Code', monospace; }
+    .match { color: #3fb950; }
+    .mismatch { color: #f85149; }
+    .pending { color: #d29922; }
+    .progress { color: #8b949e; font-size: 13px; margin-top: 4px; }
+    button { background: #238636; color: #fff; border: none; border-radius: 8px; padding: 14px 24px; cursor: pointer; font-size: 16px; margin-top: 12px; width: 100%; -webkit-tap-highlight-color: transparent; }
+    button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+    button:active:not(:disabled) { background: #2ea043; }
+    #status { margin-top: 12px; font-size: 14px; color: #8b949e; text-align: center; }
+  </style>
+</head>
+<body>
+  <h1>V2 Engine Determinism — Browser Harness</h1>
+  <div id="scenarios"></div>
+  <button id="runBtn" onclick="runAll()">Run All Scenarios</button>
+  <div id="status"></div>
+
+  <script>
+    // Catch ALL errors including module import failures
+    window.onerror = (msg, src, line, col, err) => {
+      document.getElementById('status').innerHTML = '<pre style="color:#f85149;white-space:pre-wrap;">onerror: ' + msg + '\n' + (src||'') + ':' + line + '\n' + (err?.stack||'') + '</pre>';
+    };
+    window.addEventListener('unhandledrejection', (e) => {
+      document.getElementById('status').innerHTML = '<pre style="color:#f85149;white-space:pre-wrap;">unhandledrejection: ' + (e.reason?.message || e.reason) + '\n' + (e.reason?.stack || '') + '</pre>';
+    });
+  </script>
+  <script type="module">
+    // Feature detection
+    const diag = [];
+    diag.push('BigInt: ' + (typeof BigInt !== 'undefined' ? 'YES' : 'NO'));
+    diag.push('ES modules: YES (this ran)');
+    try { const x = 1n << 40n; diag.push('BigInt ops: YES'); } catch(e) { diag.push('BigInt ops: NO - ' + e.message); }
+    document.getElementById('status').textContent = diag.join(' | ');
+
+    const { sha256 } = await import('@noble/hashes/sha2.js');
+    const { initFromSeedV2, advanceFrameV2 } = await import('../../src/core/sim_v2.ts');
+
+    // ─── Inline hash_state (avoid .ts import issues in browser) ───
+    function bytesToHex(bytes) {
+      let hex = '';
+      for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, '0');
+      return hex;
+    }
+
+    function serializePrng(prng) {
+      if (typeof prng?.__getState === 'function') {
+        const st = prng.__getState();
+        return `${bytesToHex(st.seed)}|${bytesToHex(st.buf)}|${st.i}|${st.ctr}`;
+      }
+      return 'NO_PRNG_STATE';
+    }
+
+    function serializeStateDeterministic(state) {
+      const parts = [];
+      parts.push(`F:${state.frame}`);
+      parts.push(`T2:${state.twoOrbsStartFrame ?? -1}`);
+      parts.push(`OC:${state.orbs.length}`);
+      for (let i = 0; i < state.orbs.length; i++) {
+        const o = state.orbs[i];
+        parts.push(`O${i}:${o.x}|${o.y}|${o.vx}|${o.vy}|${o.radius}|${o.gen}|${o.splitCooldown}|${o.hadTether ? 1 : 0}|${o.justCollided ? 1 : 0}`);
+        parts.push(`W${i}:${bytesToHex(o.owner)}`);
+        parts.push(`R${i}:${o.trait.restMul}|${o.trait.tanKickMul}|${o.trait.minSpeedMul}|${o.trait.jitterMul}|${o.trait.gravityMul}`);
+        parts.push(`K${i}:${o.skill.splitAggroMul}|${o.skill.tetherResMul}|${o.skill.tetherDefMul}|${o.skill.powerMul}`);
+        parts.push(`P${i}:${serializePrng(o.prng)}`);
+      }
+      parts.push(`TC:${state.tethers.length}`);
+      for (let i = 0; i < state.tethers.length; i++) {
+        const list = state.tethers[i];
+        parts.push(`TL${i}:${list.length}`);
+        for (let j = 0; j < list.length; j++) {
+          const t = list[j];
+          parts.push(`T${i}.${j}:${t.anchorX}|${t.anchorY}|${t.protect}|${t.rest ?? 0}`);
+        }
+      }
+      parts.push(`SC:${state.shockwaves.length}`);
+      for (let i = 0; i < state.shockwaves.length; i++) {
+        const w = state.shockwaves[i];
+        parts.push(`S${i}:${w.x}|${w.y}|${w.r}|${w.maxR}|${w.life}|${w.maxLife}|${w.thickness}|${w.kind}|${w.affectsTethers ? 1 : 0}`);
+      }
+      const scores = state.scores ?? {};
+      const scoreKeys = Object.keys(scores).sort();
+      parts.push(`XC:${scoreKeys.length}`);
+      for (const k of scoreKeys) {
+        const s = scores[k];
+        parts.push(`X${k}:${s.framesAlive}|${s.tethersDestroyed}|${s.score}`);
+      }
+      return new TextEncoder().encode(parts.join('\n'));
+    }
+
+    function hashStateV2(state) {
+      const bytes = serializeStateDeterministic(state);
+      const digest = sha256(bytes);
+      return bytesToHex(digest);
+    }
+
+    function makeSeed(label) {
+      return sha256(new TextEncoder().encode(label));
+    }
+
+    function makePlayers(n) {
+      const players = [];
+      for (let i = 0; i < n; i++) {
+        const pubkey = new Uint8Array(32);
+        pubkey[0] = i & 0xff;
+        pubkey[1] = (i >> 8) & 0xff;
+        const joinNonce = new Uint8Array(32);
+        joinNonce[0] = 100 + (i & 0xff);
+        players.push({ pubkey, joinNonce, color: ['#ff6b35', '#8b5cf6', '#10b981', '#f59e0b'][i % 4] });
+      }
+      return players;
+    }
+
+    // ─── Scenario configs (must match scenarios.ts exactly) ───
+    const baselineConfig = {
+      version: '2.0.3',
+      canvas: { width: 400, height: 720 },
+      ui: { preGameSeconds: 10 },
+      boundary: { shape: 'circle', radius: 190, color: '#fff', lineWidth: 2, restitution: 1.02, tangentImpulse: 0.01, minSpeed: 1.0, maxSpeed: 7.0, twoOrbsMaxSpeed: 12.0, twoOrbsRampFrames: 600, rectHalfWidth: 200, rectHalfHeight: 300 },
+      orbs: { count: 4, radius: 12, speed: 2, amplitude: 500, baseSpeed: 2, colors: ['#ff6b35', '#8b5cf6', '#10b981', '#f59e0b'], spawn: { mode: 'rings', pad: 2, startInset: 104, ringGap: 30, ringsMin: 1, ringsMax: 5, velocity: 'none', jitter: false } },
+      burst: { lineCount: 15, minLength: 50, maxLength: 200, lineWidth: 0.8, clashDistance: 25 },
+      performance: { maxLines: 5000, animationDuration: 75000 },
+      tethers: { hitDamping: 0.125, springRest: 0, springK: 0.0, springDamping: 0.0, breakSpeedMin: 3, immunityFrames: 200 },
+      gravity: { base: 0.0000000001, ampFrac: 0.4, periodFrames: 40, oscillateBelowOrbs: 3 },
+      edgeGuide: { enabled: false, radiusTargetFrac: 0.6, bandWidth: 32, k: 0.15, minSpeedGate: 0.4 },
+      edgeGravity: { strength: 0.00001, count: 0, insetPixels: 60 },
+      collisions: { orbRestitution: 1.004 },
+      split: { enabled: true, enableBelowOrbs: 5, vnThreshold: 2.0, keThreshold: 12.0, radiusScale: 1, childSpeedMul: 0.5, angleSpread: 0.45, maxGenerations: 2, cooldownFrames: 300, maxOrbsCap: 24 },
+      suddenDeath: { enabled: true, afterFrames: 600, gravityMultiplier: 2, rampFrames: 600, centerShiftRadius: 40, centerShiftPeriodFrames: 120 },
+      drama: { targetFrames: 7200, shrinkStart: 0.70, shrinkTo: 1.0, restitutionMulEnd: 1.0, gravityMulEnd: 1.8, jitterMulEnd: 1.6, easing: 'linear' },
+      fx: { shockwave: { enabled: true, lifeFrames: 40, maxRadius: 100, ringThickness: 5, respectProtect: true, cutMode: 'segment', triggerOnSplit: true, triggerOnImpact: true, impactThreshold: 4, impactCutsTethers: true } },
+      debug: { showEdgePoints: false },
+      rendering: { dimUntilBreakSpeed: false, orbDimAlpha: 0.4, tetherDimAlpha: 0.1 },
+      disableTraits: true,
+    };
+
+    const gravityAccumConfig = {
+      ...baselineConfig,
+      orbs: { ...baselineConfig.orbs, count: 2, baseSpeed: 0.5 },
+      gravity: { base: 0.001, ampFrac: 0.5, periodFrames: 20, oscillateBelowOrbs: 10 },
+      split: { ...baselineConfig.split, enabled: false },
+      suddenDeath: { enabled: false, afterFrames: 999999, gravityMultiplier: 1, rampFrames: 1, centerShiftRadius: 0, centerShiftPeriodFrames: 1 },
+    };
+
+    const stressConfig = {
+      version: '2.0.3',
+      canvas: { width: 400, height: 720 },
+      ui: { preGameSeconds: 10 },
+      boundary: { shape: 'circle', radius: 190, color: '#fff', lineWidth: 2, restitution: 1.05, tangentImpulse: 0.08, minSpeed: 2.0, maxSpeed: 10.0, twoOrbsMaxSpeed: 15.0, twoOrbsRampFrames: 300, rectHalfWidth: 200, rectHalfHeight: 300 },
+      orbs: { count: 10, radius: 10, speed: 8, amplitude: 500, baseSpeed: 8, colors: ['#ff6b35', '#8b5cf6', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#d946ef', '#84cc16', '#f97316', '#14b8a6'], spawn: { mode: 'rings', pad: 1, startInset: 20, ringGap: 24, ringsMin: 1, ringsMax: 3, velocity: 'none', jitter: false } },
+      burst: { lineCount: 15, minLength: 50, maxLength: 200, lineWidth: 0.8, clashDistance: 25 },
+      performance: { maxLines: 5000, animationDuration: 75000 },
+      tethers: { hitDamping: 0.2, springRest: 20, springK: 0.005, springDamping: 0.01, breakSpeedMin: 2, immunityFrames: 60 },
+      gravity: { base: 0.0001, ampFrac: 0.6, periodFrames: 30, oscillateBelowOrbs: 20 },
+      edgeGuide: { enabled: true, radiusTargetFrac: 0.5, bandWidth: 40, k: 0.2, minSpeedGate: 0.3 },
+      edgeGravity: { strength: 0.001, count: 4, insetPixels: 40 },
+      collisions: { orbRestitution: 1.01 },
+      split: { enabled: true, enableBelowOrbs: 20, vnThreshold: 1.0, keThreshold: 4.0, radiusScale: 1, childSpeedMul: 0.6, angleSpread: 0.5, maxGenerations: 3, cooldownFrames: 120, maxOrbsCap: 30 },
+      suddenDeath: { enabled: true, afterFrames: 200, gravityMultiplier: 3, rampFrames: 200, centerShiftRadius: 50, centerShiftPeriodFrames: 80 },
+      drama: { targetFrames: 5000, shrinkStart: 0.3, shrinkTo: 0.85, restitutionMulEnd: 1.2, gravityMulEnd: 3.0, jitterMulEnd: 2.5, easing: 'linear' },
+      fx: { shockwave: { enabled: true, lifeFrames: 30, maxRadius: 80, ringThickness: 8, respectProtect: false, cutMode: 'segment', triggerOnSplit: true, triggerOnImpact: true, impactThreshold: 3, impactCutsTethers: true } },
+      debug: { showEdgePoints: false },
+      rendering: { dimUntilBreakSpeed: false, orbDimAlpha: 0.4, tetherDimAlpha: 0.1 },
+      disableTraits: false,
+    };
+
+    const prodV210Config = {
+      version: '2.1.0',
+      canvas: { width: 400, height: 720 },
+      ui: { preGameSeconds: 10 },
+      boundary: { shape: 'circle', radius: 190, color: '#ffffff', lineWidth: 2, restitution: 1.02, tangentImpulse: 0.01, minSpeed: 1.0, maxSpeed: 7.0, twoOrbsMaxSpeed: 12.0, twoOrbsRampFrames: 600, rectHalfWidth: 200, rectHalfHeight: 300 },
+      orbs: { count: 5, radius: 12, speed: 2, amplitude: 500, baseSpeed: 2, colors: ['#ff6b35', '#8b5cf6', '#10b981', '#f59e0b', '#ef4444', '#06b6d4'], spawn: { mode: 'rings', pad: 2, startInset: 104, ringGap: 30, ringsMin: 1, ringsMax: 5, velocity: 'none', jitter: false } },
+      burst: { lineCount: 15, minLength: 50, maxLength: 200, lineWidth: 0.8, clashDistance: 25 },
+      performance: { maxLines: 5000, animationDuration: 75000 },
+      tethers: { hitDamping: 0.1, springRest: 0, springK: 0.0, springDamping: 0.0, breakSpeedMin: 3, immunityFrames: 200 },
+      gravity: { base: 0.0000000001, ampFrac: 0.4, periodFrames: 40, oscillateBelowOrbs: 3 },
+      edgeGuide: { enabled: false, radiusTargetFrac: 0.6, bandWidth: 32, k: 0.15, minSpeedGate: 0.4 },
+      edgeGravity: { strength: 0.00001, count: 0, insetPixels: 60 },
+      collisions: { orbRestitution: 1.004 },
+      split: { enabled: true, enableBelowOrbs: 5, vnThreshold: 2.0, keThreshold: 12.0, radiusScale: 1, childSpeedMul: 0.5, angleSpread: 0.45, maxGenerations: 2, cooldownFrames: 300, maxOrbsCap: 24 },
+      suddenDeath: { enabled: true, afterFrames: 350, gravityMultiplier: 2, rampFrames: 300, centerShiftRadius: 40, centerShiftPeriodFrames: 120 },
+      drama: { targetFrames: 7200, shrinkStart: 0.70, shrinkTo: 1.0, restitutionMulEnd: 1.0, gravityMulEnd: 1.8, jitterMulEnd: 1.6, easing: 'linear' },
+      fx: { shockwave: { enabled: true, lifeFrames: 40, maxRadius: 100, ringThickness: 5, respectProtect: true, cutMode: 'segment', triggerOnSplit: true, triggerOnImpact: true, impactThreshold: 4, impactCutsTethers: true } },
+      debug: { showEdgePoints: false },
+      rendering: { dimUntilBreakSpeed: false, orbDimAlpha: 0.4, tetherDimAlpha: 0.1 },
+      disableTraits: true,
+    };
+
+    const scenarios = [
+      { name: 'baseline', seed: makeSeed('determinism-baseline-v2'), players: makePlayers(4), config: baselineConfig, frames: 50000, goldenHash: '2149fc7489945afaed5a6c66e1f9ab79a5a7099997007b2443f0b2ca5d58baf5' },
+      { name: 'gravityAccum', seed: makeSeed('determinism-gravity-v2'), players: makePlayers(2), config: gravityAccumConfig, frames: 50000, goldenHash: 'b9f00a0078943c24b096d7d5994860388bec8459a29e99dfe7abc59728f18897' },
+      { name: 'tenOrbsHighSpeedStress', seed: makeSeed('determinism-stress-10orbs-v2'), players: makePlayers(10), config: stressConfig, frames: 50000, goldenHash: '1b40fe98bfc48e454c8584b74b85f7623044251b0732e399745fe3330ab5a1a0' },
+      { name: 'prodV210', seed: makeSeed('determinism-prod-v210'), players: makePlayers(10), config: prodV210Config, frames: 200000, goldenHash: 'f26f8969038877324290748524775da3969b8c44361ef9226e6fe152e1d5e258' },
+    ];
+
+    // ─── UI ───
+    const container = document.getElementById('scenarios');
+    const statusEl = document.getElementById('status');
+    const runBtn = document.getElementById('runBtn');
+
+    // Render scenario cards
+    for (const s of scenarios) {
+      const div = document.createElement('div');
+      div.className = 'scenario';
+      div.id = `sc-${s.name}`;
+      div.innerHTML = `
+        <div class="scenario-name">${s.name} (${s.frames.toLocaleString()} frames, ${s.players.length} players)</div>
+        <div class="row"><span class="label">Expected:</span><span class="hash">${s.goldenHash}</span></div>
+        <div class="row"><span class="label">Got:</span><span class="hash pending" id="hash-${s.name}">—</span></div>
+        <div class="row"><span class="label">Status:</span><span id="status-${s.name}" class="pending">waiting</span></div>
+        <div class="progress" id="progress-${s.name}"></div>
+      `;
+      container.appendChild(div);
+    }
+
+    async function runScenario(scenario) {
+      const hashEl = document.getElementById(`hash-${scenario.name}`);
+      const statusEl = document.getElementById(`status-${scenario.name}`);
+      const progressEl = document.getElementById(`progress-${scenario.name}`);
+
+      statusEl.textContent = 'running...';
+      statusEl.className = 'pending';
+      hashEl.textContent = '...';
+
+      // Yield to browser before starting
+      await new Promise(r => setTimeout(r, 10));
+
+      const { state, cfg } = initFromSeedV2(scenario.seed, scenario.players, scenario.config);
+      const t0 = performance.now();
+      const logInterval = 10000;
+      const batchSize = 1000; // yield every 1000 frames to keep UI responsive
+
+      let f = 0;
+      while (f < scenario.frames) {
+        const end = Math.min(f + batchSize, scenario.frames);
+        for (; f < end; f++) {
+          advanceFrameV2(state, cfg);
+        }
+        if (f % logInterval === 0 || f === scenario.frames) {
+          const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+          progressEl.textContent = `${f.toLocaleString()}/${scenario.frames.toLocaleString()} (${elapsed}s, ${state.orbs.length} orbs)`;
+          console.log(`[${scenario.name}] ${f}/${scenario.frames} (${elapsed}s, ${state.orbs.length} orbs)`);
+        }
+        // Yield to browser
+        await new Promise(r => setTimeout(r, 0));
+      }
+
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      const hash = hashStateV2(state);
+
+      hashEl.textContent = hash;
+      progressEl.textContent = `done in ${elapsed}s (${state.orbs.length} orbs remaining)`;
+      console.log(`[${scenario.name}] hash=${hash} (${elapsed}s)`);
+
+      if (hash === scenario.goldenHash) {
+        statusEl.textContent = '✓ MATCH';
+        statusEl.className = 'match';
+        hashEl.className = 'hash match';
+      } else {
+        statusEl.textContent = '✗ MISMATCH';
+        statusEl.className = 'mismatch';
+        hashEl.className = 'hash mismatch';
+      }
+
+      return hash === scenario.goldenHash;
+    }
+
+    window.runAll = async function() {
+      runBtn.disabled = true;
+      statusEl.textContent = 'Running...';
+      let allMatch = true;
+
+      for (const s of scenarios) {
+        const ok = await runScenario(s);
+        if (!ok) allMatch = false;
+      }
+
+      statusEl.textContent = allMatch ? '✓ All scenarios match!' : '✗ Some scenarios failed';
+      statusEl.style.color = allMatch ? '#3fb950' : '#f85149';
+      runBtn.disabled = false;
+    };
+  </script>
+</body>
+</html>
