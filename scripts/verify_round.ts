@@ -176,81 +176,89 @@ function toHex(bytes: Uint8Array | number[]): string {
 }
 
 // Dequantize spawn position - returns normalized values in [-1, 1] range
+// Must match SDK's dequantizeSpawn exactly
 function dequantizeSpawn(xQ: number, yQ: number, rotQ: number): { xNorm: number; yNorm: number; rotRad: number } {
-  // Quantization: q = round(norm * 10000) where norm is [-1, 1]
-  // Dequantize: norm = q / 10000
-  const xNorm = xQ / 10000
-  const yNorm = yQ / 10000
-  const rotRad = (rotQ / 10000) * Math.PI  // rotQ is 0-20000 mapping to 0-2π
+  // x_q, y_q are i16 quantized to [-32767, 32767] mapping to [-1, 1]
+  // rot_q is u16 quantized to [0, 65535] mapping to [0, 2π]
+  const xNorm = xQ / 32767
+  const yNorm = yQ / 32767
+  const rotRad = (rotQ / 65535) * 2 * Math.PI
   return { xNorm, yNorm, rotRad }
 }
 
-async function main() {
-  const args = parseArgs()
-  
-  console.log(`\n🔍 Verifying Round ${args.roundId} (Tier ${args.tierId}) on ${args.network}\n`)
-  
-  // Load dfinity packages
-  console.log('Loading ICP packages...')
-  await loadDfinityPackages()
-  
-  // Create ICP actor
-  const config = ICP_CONFIG[args.network]
+// Convert hex to Uint8Array
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2)
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16)
+  }
+  return bytes
+}
+
+// ─── STEP 1: Create ICP Actor ─────────────────────────────────────────────────
+async function createIcpActor(network: 'mainnet' | 'devnet') {
+  const config = ICP_CONFIG[network]
   const agent = HttpAgent.createSync({ host: config.host })
-  const actor = Actor.createActor(createIdl(), {
+  return Actor.createActor(createIdl(), {
     agent,
     canisterId: Principal.fromText(config.canisterId),
   })
-  
+}
+
+// ─── STEP 2: Fetch Round Data ─────────────────────────────────────────────────
+interface RoundData {
+  seedHex: string
+  snapshot: any
+  playerConfigs: any[]
+  engineConfig: any
+  configVersion: string
+  onChainWinnerHex: string
+}
+
+async function fetchRoundData(actor: any, roundId: number, tierId: number): Promise<RoundData> {
   // Fetch seed
   console.log('Fetching round seed...')
-  const seedResult = await actor.get_revealed_seed(args.tierId, BigInt(args.roundId))
+  const seedResult = await actor.get_revealed_seed(tierId, BigInt(roundId))
   if (!seedResult || seedResult.length === 0) {
     console.error('❌ Seed not revealed for this round. Round may not be settled yet.')
     process.exit(1)
   }
-  const seedProof = seedResult[0]
-  const seedHex = toHex(seedProof.seed)
+  const seedHex = toHex(seedResult[0].seed)
   console.log(`  Seed: ${seedHex.slice(0, 16)}...`)
-  
-  // Fetch round snapshot (contains on-chain results)
+
+  // Fetch round snapshot
   console.log('Fetching round snapshot...')
-  const snapshotResult = await actor.get_round_snapshot(args.tierId, BigInt(args.roundId))
+  const snapshotResult = await actor.get_round_snapshot(tierId, BigInt(roundId))
   if (!snapshotResult || snapshotResult.length === 0) {
     console.error('❌ Round snapshot not found. Round may not exist or is not yet archived.')
     process.exit(1)
   }
   const snapshot = snapshotResult[0]
-  
-  // Check if round has valid data (players with placements)
+
+  // Validate round data
   if (!snapshot.players || snapshot.players.length === 0) {
     console.error('❌ Round has no players. Round may not exist.')
     process.exit(1)
   }
-  
-  // Check if round is settled (has winner with placement === 1)
   const onChainWinner = snapshot.players.find((p: any) => p.placement === 1)
   if (!onChainWinner) {
     console.error('❌ Round has no winner. Round may not be settled yet.')
     process.exit(1)
   }
-  
+
   const configVersion = snapshot.config_version
   console.log(`  Config version: ${configVersion}`)
   console.log(`  Players: ${snapshot.players.length}`)
-  
-  const onChainWinnerHex = toHex(onChainWinner.player)
-  
+
   // Fetch player configs
   console.log('Fetching player configs...')
-  const configsResult = await actor.list_player_configs_if_revealed(BigInt(args.roundId), args.tierId)
+  const configsResult = await actor.list_player_configs_if_revealed(BigInt(roundId), tierId)
   if ('Err' in configsResult) {
     console.error(`❌ Failed to fetch player configs: ${configsResult.Err}`)
     process.exit(1)
   }
-  const playerConfigs = configsResult.Ok
-  console.log(`  Configs: ${playerConfigs.length}`)
-  
+  console.log(`  Configs: ${configsResult.Ok.length}`)
+
   // Fetch engine config
   console.log('Fetching engine config...')
   const engineConfigResult = await actor.get_engine_config(configVersion)
@@ -259,37 +267,46 @@ async function main() {
     process.exit(1)
   }
   const rawConfig = JSON.parse(engineConfigResult[0].config_json)
-  // The config from ICP may be wrapped in a 'config' property
   const engineConfig = rawConfig.config || rawConfig
-  
-  if (args.verbose) {
-    console.log('  Engine config keys:', Object.keys(engineConfig))
-    console.log('  orbs config:', JSON.stringify(engineConfig.orbs, null, 2))
-  }
-  
+
   // Ensure orbs.spawn exists with defaults if missing
   if (engineConfig.orbs && !engineConfig.orbs.spawn) {
     engineConfig.orbs.spawn = {
-      mode: 'rings',
-      pad: 20,
-      startInset: 40,
-      ringGap: 30,
-      ringsMin: 1,
-      ringsMax: 2,
-      velocity: 'tangent',
-      jitter: true,
+      mode: 'rings', pad: 20, startInset: 40, ringGap: 30,
+      ringsMin: 1, ringsMax: 2, velocity: 'tangent', jitter: true,
     }
   }
-  
-  // Build players from configs
+
+  return {
+    seedHex,
+    snapshot,
+    playerConfigs: configsResult.Ok,
+    engineConfig,
+    configVersion,
+    onChainWinnerHex: toHex(onChainWinner.player),
+  }
+}
+
+// ─── STEP 3: Build Players ────────────────────────────────────────────────────
+interface PlayerData {
+  pubkeyHex: string
+  joinTs: number
+  spawnXNorm: number
+  spawnYNorm: number
+  spawnRotRad: number
+  allocSplit: number
+  allocTether: number
+  allocPower: number
+  tpPreset: number
+}
+
+function buildPlayers(playerConfigs: any[], snapshot: any): PlayerData[] {
   const players = playerConfigs.map((cfg: any) => {
     const pubkeyHex = toHex(cfg.player_pubkey)
     const spawn = dequantizeSpawn(cfg.spawn_x_q, cfg.spawn_y_q, cfg.spawn_rot_q)
-    
-    // Find join_ts from snapshot for roster ordering
     const snapshotPlayer = snapshot.players.find((p: any) => toHex(p.player) === pubkeyHex)
     const joinTs = snapshotPlayer ? Number(snapshotPlayer.join_ts) : 0
-    
+
     return {
       pubkeyHex,
       joinTs,
@@ -302,61 +319,45 @@ async function main() {
       tpPreset: cfg.tp_preset,
     }
   })
-  
-  // Sort by joinTs (roster order) with pubkey tiebreaker (matches orb-workers)
-  players.sort((a: any, b: any) => {
+
+  // Sort by joinTs with pubkey tiebreaker (matches orb-workers)
+  players.sort((a, b) => {
     const joinDiff = a.joinTs - b.joinTs
     if (joinDiff !== 0) return joinDiff
-    // Tiebreaker: base58 pubkey comparison
-    const aKey = hexToPubkey(a.pubkeyHex)
-    const bKey = hexToPubkey(b.pubkeyHex)
-    return aKey.localeCompare(bKey)
+    return hexToPubkey(a.pubkeyHex).localeCompare(hexToPubkey(b.pubkeyHex))
   })
-  
-  console.log('\n📋 Roster (sorted by join time):')
-  players.forEach((p: any, i: number) => {
-    console.log(`  ${i + 1}. ${p.pubkeyHex.slice(0, 8)}... (joined: ${p.joinTs})`)
-  })
-  
-  // Import engine
-  console.log('\n⚙️  Running simulation...')
-  const { initFromSeedV2, advanceFrameV2, countUniqueOwnersV2 } = await import('../src/core/v2/sim_v2.js')
-  
-  // Convert hex to Uint8Array
-  function hexToBytes(hex: string): Uint8Array {
-    const bytes = new Uint8Array(hex.length / 2)
-    for (let i = 0; i < bytes.length; i++) {
-      bytes[i] = parseInt(hex.substr(i * 2, 2), 16)
-    }
-    return bytes
-  }
-  
-  // Convert to engine player format
-  // Player type expects: { pubkey: Uint8Array; joinNonce: Uint8Array; color?: string }
-  const enginePlayers = players.map((p: any, index: number) => ({
-    pubkey: hexToBytes(p.pubkeyHex),
-    joinNonce: new Uint8Array(8), // Not used for determinism, just needs to exist
-  }))
-  
-  // Build skill multipliers map (InitOpts.multipliersByOwnerHex)
+
+  return players
+}
+
+// ─── STEP 4: Build Simulation Inputs ──────────────────────────────────────────
+function buildSimulationInputs(players: PlayerData[], engineConfig: any, args: Args, seedHex: string, configVersion: string) {
+  // Skill multipliers (diminishing returns curve)
+  const skillCurve = { a: 0.5, k: 0.5 }
+  const calcMul = (points: number) => 1 + skillCurve.a * (1 - Math.exp(-skillCurve.k * points))
+
+  // accelMul replaces powerMul in V2 (3.1.0+). Old rounds used accelMul=1.0 (fallback)
+  const clean = configVersion.split('-')[0].split('+')[0]
+  const [maj, min] = clean.split('.').map(n => parseInt(n, 10) || 0)
+  const useAccel = maj > 3 || (maj === 3 && min >= 1)
+
   const multipliersByOwnerHex: Record<string, any> = {}
   for (const p of players) {
     multipliersByOwnerHex[p.pubkeyHex] = {
-      splitAggroMul: 1.0 + (p.allocSplit / 100),
-      tetherResMul: 1.0, // deprecated, always 1.0
-      tetherDefMul: 1.0 + (p.allocTether / 100),
-      powerMul: 1.0, // deprecated, always 1.0
-      accelMul: 1.0 + (p.allocPower / 100),
+      splitAggroMul: calcMul(p.allocSplit),
+      tetherResMul: 1.0,
+      tetherDefMul: calcMul(p.allocTether),
+      powerMul: 1,  // deprecated – replaced by accelMul in V2
+      accelMul: useAccel ? calcMul(p.allocPower) : 1,
     }
   }
-  
-  // Build spawn positions map (InitOpts.spawnByOwnerHex)
-  // Convert normalized [-1, 1] to pixel coordinates
+
+  // Spawn positions
   const cx = engineConfig.canvas.width / 2
   const cy = engineConfig.canvas.height / 2
   const R = engineConfig.boundary.radius
-  const baseSpeed = engineConfig.orbs.baseSpeed ?? 2
-  
+  const baseSpeed = engineConfig.orbs.baseSpeed ?? 8
+
   const spawnByOwnerHex: Record<string, any> = {}
   for (const p of players) {
     spawnByOwnerHex[p.pubkeyHex] = {
@@ -366,19 +367,9 @@ async function main() {
       speed: baseSpeed,
     }
   }
-  
-  if (args.verbose) {
-    console.log('  Skill multipliers:', JSON.stringify(multipliersByOwnerHex, null, 2))
-  }
-  
-  // Convert seed hex to bytes
-  const seedBytes = new Uint8Array(32)
-  for (let i = 0; i < 32; i++) {
-    seedBytes[i] = parseInt(seedHex.substr(i * 2, 2), 16)
-  }
-  
-  // Build economics inputs for tracking kills/placements
-  const roster = players.map((p: any) => p.pubkeyHex)
+
+  // Economics inputs
+  const roster = players.map(p => p.pubkeyHex)
   const economicsInputs = {
     header: {
       round_id: args.roundId,
@@ -387,151 +378,322 @@ async function main() {
       rules_hash: 'verify',
       build_hash: 'verify',
       mode: 'paid' as const,
-      economy_model: 'weighted_kill_v2' as const,
+      economy_model: 'weighted_kill_v2_inherit' as const,
+      dev_fee_bps: 0,
     },
     economic_params: {
       total_players: players.length,
-      entry_amount_lamports: 8_000_000, // 0.008 SOL default
+      entry_amount_lamports: 8_000_000,
       bounty_bps: 7000,
       survival_bps: 3000,
     },
     roster,
   }
-  
-  // Add economics to config
+
+  // Engine players
+  const enginePlayers = players.map(p => ({
+    pubkey: hexToBytes(p.pubkeyHex),
+    joinNonce: new Uint8Array(8),
+  }))
+
+  // Seed bytes
+  const seedBytes = new Uint8Array(32)
+  for (let i = 0; i < 32; i++) {
+    seedBytes[i] = parseInt(seedHex.substr(i * 2, 2), 16)
+  }
+
+  return {
+    multipliersByOwnerHex,
+    spawnByOwnerHex,
+    economicsInputs,
+    enginePlayers,
+    seedBytes,
+  }
+}
+
+// ─── STEP 5: Run Simulation ───────────────────────────────────────────────────
+async function runSimulation(
+  seedBytes: Uint8Array,
+  enginePlayers: any[],
+  engineConfig: any,
+  economicsInputs: any,
+  multipliersByOwnerHex: Record<string, any>,
+  spawnByOwnerHex: Record<string, any>,
+  verbose: boolean
+) {
+  const { initFromSeedV2, advanceFrameV2, countUniqueOwnersV2 } = await import('../src/core/v2/sim_v2.js')
+
   const configWithEcon = { ...engineConfig, economicsInputs }
-  
-  // Initialize simulation with opts (args: roundSeed, players, config, opts)
   const initOpts = { multipliersByOwnerHex, spawnByOwnerHex }
   const { state, cfg } = initFromSeedV2(seedBytes, enginePlayers, configWithEcon, initOpts)
-  
-  // Run simulation
-  const maxFrames = 72000 // 10 minutes at 120fps
+
+  const maxFrames = 72000
   let frame = 0
   let currentState = state
+
   while (countUniqueOwnersV2(currentState.orbs) > 1 && frame < maxFrames) {
     const result = advanceFrameV2(currentState, cfg)
     currentState = result.state
     frame++
-    
-    if (args.verbose && frame % 6000 === 0) {
+    if (verbose && frame % 6000 === 0) {
       console.log(`  Frame ${frame}: ${countUniqueOwnersV2(currentState.orbs)} players remaining`)
     }
   }
-  
-  // Find winner - in V2, orbs are removed when eliminated, so remaining orbs are all alive
-  // Get unique owners from remaining orbs
+
+  // Find winner
   const remainingOwners = new Set<string>()
   for (const o of currentState.orbs) {
     remainingOwners.add(toHex(o.owner))
   }
   const winnerHex = remainingOwners.size === 1 ? Array.from(remainingOwners)[0] : null
-  
-  console.log(`\n✅ Simulation complete at frame ${frame}`)
-  console.log(`   Unique owners remaining: ${countUniqueOwnersV2(currentState.orbs)}`)
-  
-  // Compare results - display as Solana pubkeys (base58)
-  const onChainWinnerPubkey = onChainWinnerHex ? hexToPubkey(onChainWinnerHex) : null
-  const simulatedWinnerPubkey = winnerHex ? hexToPubkey(winnerHex) : null
-  
+
+  return { currentState, frame, winnerHex, countUniqueOwnersV2 }
+}
+
+// ─── STEP 6: Verify Winner ────────────────────────────────────────────────────
+function verifyWinner(onChainWinnerHex: string, simulatedWinnerHex: string | null): boolean {
+  const onChainPubkey = hexToPubkey(onChainWinnerHex)
+  const simPubkey = simulatedWinnerHex ? hexToPubkey(simulatedWinnerHex) : null
+
   console.log('\n📊 Results:')
-  console.log(`   On-chain winner:  ${onChainWinnerPubkey || 'N/A'}`)
-  console.log(`   Simulated winner: ${simulatedWinnerPubkey || 'N/A'}`)
-  
-  if (onChainWinnerHex && winnerHex) {
-    if (onChainWinnerHex === winnerHex) {
-      console.log('\n🎉 VERIFIED: Simulation matches on-chain result!')
-    } else {
-      console.log('\n❌ MISMATCH: Simulation does not match on-chain result!')
-      console.log('   This could indicate:')
-      console.log('   - Different engine config version')
-      console.log('   - Missing or incorrect player configs')
-      console.log('   - Engine bug')
-      process.exit(1)
-    }
+  console.log(`   On-chain winner:  ${onChainPubkey}`)
+  console.log(`   Simulated winner: ${simPubkey || 'N/A'}`)
+
+  if (simulatedWinnerHex && onChainWinnerHex === simulatedWinnerHex) {
+    console.log('\n🎉 VERIFIED: Simulation matches on-chain result!')
+    return true
+  } else if (simulatedWinnerHex) {
+    console.log('\n❌ MISMATCH: Simulation does not match on-chain result!')
+    console.log('   This could indicate:')
+    console.log('   - Different engine config version')
+    console.log('   - Missing or incorrect player configs')
+    console.log('   - Engine bug')
+    return false
   } else {
     console.log('\n⚠️  Could not compare results (missing winner data)')
+    return false
   }
-  
-  // Build simulated rankings from econ.perPlayer
-  // perPlayer[hex] = { kills, framesAlive, death_frame, ... }
-  // Use framesAlive for ranking (matches orb-workers extractRankings)
-  const simRankings: { pubkeyHex: string; placement: number; kills: number; framesAlive: number; deathFrame?: number }[] = []
+}
+
+// ─── STEP 7: Build Rankings ───────────────────────────────────────────────────
+interface RankingEntry {
+  pubkeyHex: string
+  placement: number
+  kills: number
+  framesAlive: number
+  deathFrame?: number
+}
+
+function buildSimulatedRankings(currentState: any, players: PlayerData[]): RankingEntry[] {
   const perPlayer = currentState.econ?.perPlayer || {}
-  const playerCount = players.length
-  
-  // Build list with framesAlive
+
+  // Count inherited/lost kills
+  const inheritedKills: Record<string, number> = {}
+  const lostKills: Record<string, number> = {}
+  const killInheritEvents = (currentState.econ?.events?.filter((e: any) => e.type === 'KillInheritance') || []) as any[]
+
+  for (const ev of killInheritEvents) {
+    const victimKills = (perPlayer[ev.victim_id] as any)?.kills || 0
+    inheritedKills[ev.killer_id] = (inheritedKills[ev.killer_id] || 0) + victimKills
+    lostKills[ev.victim_id] = (lostKills[ev.victim_id] || 0) + victimKills
+  }
+
+  // Build rankings
+  const simRankings: RankingEntry[] = []
   for (const [pubkeyHex, data] of Object.entries(perPlayer)) {
+    const directKills = (data as any).kills || 0
+    const inherited = inheritedKills[pubkeyHex] || 0
+    const lost = lostKills[pubkeyHex] || 0
     simRankings.push({
       pubkeyHex,
-      placement: 0, // Will be computed
-      kills: (data as any).kills || 0,
+      placement: 0,
+      kills: directKills + inherited - lost,
       framesAlive: (data as any).framesAlive || 0,
       deathFrame: (data as any).death_frame,
     })
   }
-  
-  // Sort by framesAlive descending (matches orb-workers), then kills, then roster index
-  const rosterOrder = players.map((p: any) => p.pubkeyHex)
+
+  // Sort by framesAlive desc, kills desc, roster index
+  const rosterOrder = players.map(p => p.pubkeyHex)
   simRankings.sort((a, b) => {
-    // Higher framesAlive = survived longer = better placement
     if (b.framesAlive !== a.framesAlive) return b.framesAlive - a.framesAlive
-    // More kills = better
     if (b.kills !== a.kills) return b.kills - a.kills
-    // Roster index tiebreaker (lower index wins)
-    const aIdx = rosterOrder.indexOf(a.pubkeyHex)
-    const bIdx = rosterOrder.indexOf(b.pubkeyHex)
-    return aIdx - bIdx
+    return rosterOrder.indexOf(a.pubkeyHex) - rosterOrder.indexOf(b.pubkeyHex)
   })
-  
-  // Assign placements
+
   for (let i = 0; i < simRankings.length; i++) {
     simRankings[i].placement = i + 1
   }
-  
-  // Build on-chain rankings
-  const onChainRankings = snapshot.players.map((p: any) => ({
-    pubkeyHex: toHex(p.player),
-    placement: p.placement,
-    kills: p.kills,
-  })).sort((a: any, b: any) => a.placement - b.placement)
-  
-  // Compare full roster
+
+  return simRankings
+}
+
+function buildOnChainRankings(snapshot: any): { pubkeyHex: string; placement: number; kills: number }[] {
+  return snapshot.players
+    .map((p: any) => ({ pubkeyHex: toHex(p.player), placement: p.placement, kills: p.kills }))
+    .sort((a: any, b: any) => a.placement - b.placement)
+}
+
+// ─── STEP 8: Verify Roster ────────────────────────────────────────────────────
+function verifyRoster(onChainRankings: any[], simRankings: RankingEntry[]): boolean {
   console.log('\n📋 Full Roster Verification:')
   console.log('   Place | On-Chain                           | Simulated                          | Kills | DeathFrame')
   console.log('   ------|------------------------------------|------------------------------------|-------|----------')
-  
+
   let allMatch = true
   for (let i = 0; i < Math.max(onChainRankings.length, simRankings.length); i++) {
     const onChain = onChainRankings[i]
     const sim = simRankings[i]
-    
+
     const onChainPubkey = onChain ? hexToPubkey(onChain.pubkeyHex) : 'N/A'
     const simPubkey = sim ? hexToPubkey(sim.pubkeyHex) : 'N/A'
     const onChainKills = onChain ? onChain.kills : '-'
     const simKills = sim ? sim.kills : '-'
     const deathFrame = sim ? (sim.deathFrame ?? 'winner') : '-'
-    
+    const framesAlive = sim ? sim.framesAlive : '-'
+
     const placeMatch = onChain && sim && onChain.pubkeyHex === sim.pubkeyHex
     const killsMatch = onChain && sim && onChain.kills === sim.kills
     const marker = placeMatch ? (killsMatch ? '✅' : '⚠️') : '❌'
-    
+
     if (!placeMatch) allMatch = false
-    
-    const framesAlive = sim ? sim.framesAlive : '-'
+
     console.log(`   ${marker} ${i + 1}   | ${onChainPubkey.padEnd(34)} | ${simPubkey.padEnd(34)} | ${String(onChainKills).padEnd(1)}/${String(simKills).padEnd(1)}   | ${framesAlive}`)
   }
-  
+
   if (allMatch) {
     console.log('\n🎉 FULL ROSTER VERIFIED: All placements match!')
   } else {
     console.log('\n❌ ROSTER MISMATCH: Some placements differ!')
-    // Show debug info
+  }
+
+  return allMatch
+}
+
+// ─── STEP 9: Verify Payouts ───────────────────────────────────────────────────
+function verifyPayouts(onChainRankings: any[], currentState: any, snapshot: any): boolean {
+  const perPlayer = currentState.econ?.perPlayer || {}
+
+  console.log('\n💰 Payout Verification:')
+  console.log('   Player                              | On-Chain      | Simulated     | Diff')
+  console.log('   ------------------------------------|---------------|---------------|------')
+
+  let payoutMatch = true
+  let totalOnChain = 0
+  let totalSimulated = 0
+
+  for (const onChain of onChainRankings) {
+    const simData = perPlayer[onChain.pubkeyHex] as any
+    const onChainPayout = Number(snapshot.players.find((p: any) => toHex(p.player) === onChain.pubkeyHex)?.payout_lamports || 0)
+    const simPayout = simData ? Math.round(simData.total_earned || 0) : 0
+
+    totalOnChain += onChainPayout
+    totalSimulated += simPayout
+
+    const diff = onChainPayout - simPayout
+    const diffStr = diff === 0 ? '✅' : (diff > 0 ? `+${diff}` : `${diff}`)
+    const marker = diff === 0 ? '✅' : '⚠️'
+
+    if (diff !== 0) payoutMatch = false
+
+    const pubkey = hexToPubkey(onChain.pubkeyHex)
+    console.log(`   ${marker} ${pubkey.padEnd(34)} | ${(onChainPayout / 1e9).toFixed(6)} SOL | ${(simPayout / 1e9).toFixed(6)} SOL | ${diffStr}`)
+  }
+
+  console.log('   ------------------------------------|---------------|---------------|------')
+  console.log(`   Total                               | ${(totalOnChain / 1e9).toFixed(6)} SOL | ${(totalSimulated / 1e9).toFixed(6)} SOL |`)
+
+  // Show TP events
+  const tpEvents = (currentState.econ?.events?.filter((e: any) => e.type === 'TPCashout') || []) as any[]
+  if (tpEvents.length > 0) {
+    console.log('\n📤 TP Cashout Events:')
+    for (const tp of tpEvents) {
+      console.log(`   Frame ${tp.frame}: ${hexToPubkey(tp.player_id)} cashed out ${(tp.amount / 1e9).toFixed(6)} SOL (target: ${(tp.target / 1e9).toFixed(6)} SOL)`)
+    }
+  }
+
+  // Show kill inheritance events
+  const inheritEvents = (currentState.econ?.events?.filter((e: any) => e.type === 'KillInheritance') || []) as any[]
+  if (inheritEvents.length > 0) {
+    console.log('\n🔄 Kill Inheritance Events:')
+    for (const ev of inheritEvents) {
+      console.log(`   Frame ${ev.frame}: ${hexToPubkey(ev.killer_id).slice(0, 8)}... inherited ${(ev.transferred / 1e9).toFixed(6)} SOL from ${hexToPubkey(ev.victim_id).slice(0, 8)}...`)
+    }
+  }
+
+  if (payoutMatch) {
+    console.log('\n🎉 PAYOUTS VERIFIED: All payouts match!')
+  } else {
+    console.log('\n⚠️  PAYOUT MISMATCH: Some payouts differ (may be due to rounding or dev fee)')
+  }
+
+  return payoutMatch
+}
+
+// ─── MAIN ─────────────────────────────────────────────────────────────────────
+async function main() {
+  const args = parseArgs()
+  console.log(`\n🔍 Verifying Round ${args.roundId} (Tier ${args.tierId}) on ${args.network}\n`)
+
+  // Step 1: Load ICP packages and create actor
+  console.log('Loading ICP packages...')
+  await loadDfinityPackages()
+  const actor = await createIcpActor(args.network)
+
+  // Step 2: Fetch round data
+  const roundData = await fetchRoundData(actor, args.roundId, args.tierId)
+
+  // Step 3: Build players
+  const players = buildPlayers(roundData.playerConfigs, roundData.snapshot)
+  console.log('\n📋 Roster (sorted by join time):')
+  players.forEach((p, i) => {
+    console.log(`  ${i + 1}. ${p.pubkeyHex.slice(0, 8)}... (joined: ${p.joinTs}, alloc: split=${p.allocSplit} tether=${p.allocTether} power=${p.allocPower})`)
+  })
+
+  // Step 4: Build simulation inputs
+  console.log('\n⚙️  Running simulation...')
+  const simInputs = buildSimulationInputs(players, roundData.engineConfig, args, roundData.seedHex, roundData.configVersion)
+
+  if (args.verbose) {
+    console.log('  Skill multipliers:', JSON.stringify(simInputs.multipliersByOwnerHex, null, 2))
+  }
+
+  // Step 5: Run simulation
+  const simResult = await runSimulation(
+    simInputs.seedBytes,
+    simInputs.enginePlayers,
+    roundData.engineConfig,
+    simInputs.economicsInputs,
+    simInputs.multipliersByOwnerHex,
+    simInputs.spawnByOwnerHex,
+    args.verbose
+  )
+
+  console.log(`\n✅ Simulation complete at frame ${simResult.frame}`)
+  console.log(`   Unique owners remaining: ${simResult.countUniqueOwnersV2(simResult.currentState.orbs)}`)
+
+  // Step 6: Verify winner
+  const winnerMatch = verifyWinner(roundData.onChainWinnerHex, simResult.winnerHex)
+  if (!winnerMatch && simResult.winnerHex) {
+    process.exit(1)
+  }
+
+  // Step 7: Build rankings
+  const simRankings = buildSimulatedRankings(simResult.currentState, players)
+  const onChainRankings = buildOnChainRankings(roundData.snapshot)
+
+  // Step 8: Verify roster
+  const rosterMatch = verifyRoster(onChainRankings, simRankings)
+  if (!rosterMatch) {
     console.log('\n🔍 Debug - Simulated perPlayer data:')
+    const perPlayer = simResult.currentState.econ?.perPlayer || {}
     for (const [hex, data] of Object.entries(perPlayer)) {
       console.log(`   ${hexToPubkey(hex)}: framesAlive=${(data as any).framesAlive}, kills=${(data as any).kills}`)
     }
   }
+
+  // Step 9: Verify payouts
+  verifyPayouts(onChainRankings, simResult.currentState, roundData.snapshot)
 }
 
 main().catch(err => {

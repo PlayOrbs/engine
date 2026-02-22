@@ -341,3 +341,11 @@ export function shouldUseV2(configVersion: string): boolean {
   const maj = parseInt(parts[0], 10) || 0
   return maj >= 3
 }
+
+export function shouldUseAccelMul(configVersion: string): boolean {
+  // accelMul replaces powerMul for V2 acceleration boost — gate at 3.1.0+
+  // Old rounds (< 3.1.0) were settled with accelMul = 1.0 (fallback)
+  const clean = configVersion.split('-')[0].split('+')[0]
+  const [maj, min] = clean.split('.').map(n => parseInt(n, 10) || 0)
+  return maj > 3 || (maj === 3 && min >= 1)
+}

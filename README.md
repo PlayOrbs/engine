@@ -140,6 +140,10 @@ Frame evolution depends solely on:
 
 ## Simulation Tools
 
+### Known Affected Rounds
+
+> **⚠️ Rounds 120–130 (Tier 0, Mainnet)** were settled with an engine bug (incorrect split detection scaling). Verification of these rounds will **not match** on-chain results. This was fixed in engine version 3.0.3+.
+
 ### Round Verification (`scripts/verify_round.ts`)
 
 Verify any settled round by fetching data from ICP and running the deterministic simulation locally.
