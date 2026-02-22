@@ -217,17 +217,29 @@ async function main() {
   console.log('Fetching round snapshot...')
   const snapshotResult = await actor.get_round_snapshot(args.tierId, BigInt(args.roundId))
   if (!snapshotResult || snapshotResult.length === 0) {
-    console.error('❌ Round snapshot not found.')
+    console.error('❌ Round snapshot not found. Round may not exist or is not yet archived.')
     process.exit(1)
   }
   const snapshot = snapshotResult[0]
+  
+  // Check if round has valid data (players with placements)
+  if (!snapshot.players || snapshot.players.length === 0) {
+    console.error('❌ Round has no players. Round may not exist.')
+    process.exit(1)
+  }
+  
+  // Check if round is settled (has winner with placement === 1)
+  const onChainWinner = snapshot.players.find((p: any) => p.placement === 1)
+  if (!onChainWinner) {
+    console.error('❌ Round has no winner. Round may not be settled yet.')
+    process.exit(1)
+  }
+  
   const configVersion = snapshot.config_version
   console.log(`  Config version: ${configVersion}`)
   console.log(`  Players: ${snapshot.players.length}`)
   
-  // Find on-chain winner (placement === 1)
-  const onChainWinner = snapshot.players.find((p: any) => p.placement === 1)
-  const onChainWinnerHex = onChainWinner ? toHex(onChainWinner.player) : null
+  const onChainWinnerHex = toHex(onChainWinner.player)
   
   // Fetch player configs
   console.log('Fetching player configs...')
@@ -365,9 +377,33 @@ async function main() {
     seedBytes[i] = parseInt(seedHex.substr(i * 2, 2), 16)
   }
   
+  // Build economics inputs for tracking kills/placements
+  const roster = players.map((p: any) => p.pubkeyHex)
+  const economicsInputs = {
+    header: {
+      round_id: args.roundId,
+      seed_hex: seedHex,
+      map_id: 'default',
+      rules_hash: 'verify',
+      build_hash: 'verify',
+      mode: 'paid' as const,
+      economy_model: 'weighted_kill_v2' as const,
+    },
+    economic_params: {
+      total_players: players.length,
+      entry_amount_lamports: 8_000_000, // 0.008 SOL default
+      bounty_bps: 7000,
+      survival_bps: 3000,
+    },
+    roster,
+  }
+  
+  // Add economics to config
+  const configWithEcon = { ...engineConfig, economicsInputs }
+  
   // Initialize simulation with opts (args: roundSeed, players, config, opts)
   const initOpts = { multipliersByOwnerHex, spawnByOwnerHex }
-  const { state, cfg } = initFromSeedV2(seedBytes, enginePlayers, engineConfig, initOpts)
+  const { state, cfg } = initFromSeedV2(seedBytes, enginePlayers, configWithEcon, initOpts)
   
   // Run simulation
   const maxFrames = 72000 // 10 minutes at 120fps
@@ -417,12 +453,84 @@ async function main() {
     console.log('\n⚠️  Could not compare results (missing winner data)')
   }
   
-  // Show final rankings
-  if (args.verbose) {
-    console.log('\n📈 Final State:')
-    state.orbs.forEach((o: any, i: number) => {
-      console.log(`   Orb ${i}: owner=${o.ownerHex.slice(0, 8)}... alive=${o.alive}`)
+  // Build simulated rankings from econ.perPlayer
+  // perPlayer[hex] = { kills, framesAlive, death_frame, ... }
+  // Use framesAlive for ranking (matches orb-workers extractRankings)
+  const simRankings: { pubkeyHex: string; placement: number; kills: number; framesAlive: number; deathFrame?: number }[] = []
+  const perPlayer = currentState.econ?.perPlayer || {}
+  const playerCount = players.length
+  
+  // Build list with framesAlive
+  for (const [pubkeyHex, data] of Object.entries(perPlayer)) {
+    simRankings.push({
+      pubkeyHex,
+      placement: 0, // Will be computed
+      kills: (data as any).kills || 0,
+      framesAlive: (data as any).framesAlive || 0,
+      deathFrame: (data as any).death_frame,
     })
+  }
+  
+  // Sort by framesAlive descending (matches orb-workers), then kills, then roster index
+  const rosterOrder = players.map((p: any) => p.pubkeyHex)
+  simRankings.sort((a, b) => {
+    // Higher framesAlive = survived longer = better placement
+    if (b.framesAlive !== a.framesAlive) return b.framesAlive - a.framesAlive
+    // More kills = better
+    if (b.kills !== a.kills) return b.kills - a.kills
+    // Roster index tiebreaker (lower index wins)
+    const aIdx = rosterOrder.indexOf(a.pubkeyHex)
+    const bIdx = rosterOrder.indexOf(b.pubkeyHex)
+    return aIdx - bIdx
+  })
+  
+  // Assign placements
+  for (let i = 0; i < simRankings.length; i++) {
+    simRankings[i].placement = i + 1
+  }
+  
+  // Build on-chain rankings
+  const onChainRankings = snapshot.players.map((p: any) => ({
+    pubkeyHex: toHex(p.player),
+    placement: p.placement,
+    kills: p.kills,
+  })).sort((a: any, b: any) => a.placement - b.placement)
+  
+  // Compare full roster
+  console.log('\n📋 Full Roster Verification:')
+  console.log('   Place | On-Chain                           | Simulated                          | Kills | DeathFrame')
+  console.log('   ------|------------------------------------|------------------------------------|-------|----------')
+  
+  let allMatch = true
+  for (let i = 0; i < Math.max(onChainRankings.length, simRankings.length); i++) {
+    const onChain = onChainRankings[i]
+    const sim = simRankings[i]
+    
+    const onChainPubkey = onChain ? hexToPubkey(onChain.pubkeyHex) : 'N/A'
+    const simPubkey = sim ? hexToPubkey(sim.pubkeyHex) : 'N/A'
+    const onChainKills = onChain ? onChain.kills : '-'
+    const simKills = sim ? sim.kills : '-'
+    const deathFrame = sim ? (sim.deathFrame ?? 'winner') : '-'
+    
+    const placeMatch = onChain && sim && onChain.pubkeyHex === sim.pubkeyHex
+    const killsMatch = onChain && sim && onChain.kills === sim.kills
+    const marker = placeMatch ? (killsMatch ? '✅' : '⚠️') : '❌'
+    
+    if (!placeMatch) allMatch = false
+    
+    const framesAlive = sim ? sim.framesAlive : '-'
+    console.log(`   ${marker} ${i + 1}   | ${onChainPubkey.padEnd(34)} | ${simPubkey.padEnd(34)} | ${String(onChainKills).padEnd(1)}/${String(simKills).padEnd(1)}   | ${framesAlive}`)
+  }
+  
+  if (allMatch) {
+    console.log('\n🎉 FULL ROSTER VERIFIED: All placements match!')
+  } else {
+    console.log('\n❌ ROSTER MISMATCH: Some placements differ!')
+    // Show debug info
+    console.log('\n🔍 Debug - Simulated perPlayer data:')
+    for (const [hex, data] of Object.entries(perPlayer)) {
+      console.log(`   ${hexToPubkey(hex)}: framesAlive=${(data as any).framesAlive}, kills=${(data as any).kills}`)
+    }
   }
 }
 
