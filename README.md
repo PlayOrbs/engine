@@ -140,9 +140,13 @@ Frame evolution depends solely on:
 
 ## Simulation Tools
 
-### Known Affected Rounds
+### Verification Compatibility
 
-> **⚠️ Rounds 120–130 (Tier 0, Mainnet)** were settled with an engine bug (incorrect split detection scaling). Verification of these rounds will **not match** on-chain results. This was fixed in engine version 3.0.3+.
+> **ℹ️ The verifier supports rounds with config version 3.0.0+** (V2 engine). Older rounds (config < 3.0.0) used the V1 engine and cannot be verified with this script.
+>
+> - **Mainnet**: Rounds ~130+ (config 3.0.0+)
+> - **Devnet**: Rounds ~940+ (config 3.0.0+)
+
 
 ### Round Verification (`scripts/verify_round.ts`)
 
@@ -150,13 +154,13 @@ Verify any settled round by fetching data from ICP and running the deterministic
 
 ```bash
 # Verify a mainnet round
-bun scripts/verify_round.ts --round 100 --tier 0 --network mainnet
+bun scripts/verify_round.ts --round 131 --tier 0 --network mainnet
 
 # Verify a devnet round
-bun scripts/verify_round.ts --round 50 --tier 0 --network devnet
+bun scripts/verify_round.ts --round 950 --tier 0 --network devnet
 
 # Verbose output (show frame progress)
-bun scripts/verify_round.ts --round 100 --tier 0 --network mainnet --verbose
+bun scripts/verify_round.ts --round 131 --tier 0 --network mainnet --verbose
 ```
 
 **What it does:**
