@@ -16,6 +16,15 @@
  *   --verbose        Show detailed simulation output
  */
 
+import { hkdf } from '@noble/hashes/hkdf'
+import { sha256 } from '@noble/hashes/sha256'
+
+// Derive deterministic join nonce (matches orb-workers)
+function deriveJoinNonce(roundSeed: Uint8Array, playerIndex: number): Uint8Array {
+  const info = new TextEncoder().encode(`join_nonce:${playerIndex}`)
+  return hkdf(sha256, roundSeed, new Uint8Array(0), info, 32)
+}
+
 // ICP canister configuration
 const ICP_CONFIG = {
   mainnet: {
@@ -320,11 +329,13 @@ function buildPlayers(playerConfigs: any[], snapshot: any): PlayerData[] {
     }
   })
 
-  // Sort by joinTs with pubkey tiebreaker (matches orb-workers)
+  // Sort by joinTs with base58 pubkey tiebreaker (matches orb-workers round-state.service.ts)
   players.sort((a, b) => {
     const joinDiff = a.joinTs - b.joinTs
     if (joinDiff !== 0) return joinDiff
-    return hexToPubkey(a.pubkeyHex).localeCompare(hexToPubkey(b.pubkeyHex))
+    const aKey = hexToPubkey(a.pubkeyHex)
+    const bKey = hexToPubkey(b.pubkeyHex)
+    return aKey < bKey ? -1 : aKey > bKey ? 1 : 0
   })
 
   return players
@@ -336,7 +347,7 @@ function buildSimulationInputs(players: PlayerData[], engineConfig: any, args: A
   const skillCurve = { a: 0.5, k: 0.5 }
   const calcMul = (points: number) => 1 + skillCurve.a * (1 - Math.exp(-skillCurve.k * points))
 
-  // accelMul replaces powerMul in V2 (3.1.0+). Old rounds used accelMul=1.0 (fallback)
+  // accelMul replaces powerMul in V2 (3.1.0+). Old rounds used powerMul.
   const clean = configVersion.split('-')[0].split('+')[0]
   const [maj, min] = clean.split('.').map(n => parseInt(n, 10) || 0)
   const useAccel = maj > 3 || (maj === 3 && min >= 1)
@@ -347,8 +358,8 @@ function buildSimulationInputs(players: PlayerData[], engineConfig: any, args: A
       splitAggroMul: calcMul(p.allocSplit),
       tetherResMul: 1.0,
       tetherDefMul: calcMul(p.allocTether),
-      powerMul: 1,  // deprecated – replaced by accelMul in V2
-      accelMul: useAccel ? calcMul(p.allocPower) : 1,
+      powerMul: useAccel ? 1 : calcMul(p.allocPower),  // old configs used powerMul
+      accelMul: useAccel ? calcMul(p.allocPower) : 1,  // new configs use accelMul
     }
   }
 
@@ -390,17 +401,17 @@ function buildSimulationInputs(players: PlayerData[], engineConfig: any, args: A
     roster,
   }
 
-  // Engine players
-  const enginePlayers = players.map(p => ({
-    pubkey: hexToBytes(p.pubkeyHex),
-    joinNonce: new Uint8Array(8),
-  }))
-
-  // Seed bytes
+  // Seed bytes (needed for deriveJoinNonce)
   const seedBytes = new Uint8Array(32)
   for (let i = 0; i < 32; i++) {
     seedBytes[i] = parseInt(seedHex.substr(i * 2, 2), 16)
   }
+
+  // Engine players with deterministic join nonces (matches orb-workers)
+  const enginePlayers = players.map((p, idx) => ({
+    pubkey: hexToBytes(p.pubkeyHex),
+    joinNonce: deriveJoinNonce(seedBytes, idx),
+  }))
 
   return {
     multipliersByOwnerHex,
@@ -419,13 +430,25 @@ async function runSimulation(
   economicsInputs: any,
   multipliersByOwnerHex: Record<string, any>,
   spawnByOwnerHex: Record<string, any>,
+  players: PlayerData[],
   verbose: boolean
 ) {
   const { initFromSeedV2, advanceFrameV2, countUniqueOwnersV2 } = await import('../src/core/v2/sim_v2.js')
+  const { applyTPPresetsToTargets } = await import('../src/economics/scoring.js')
 
   const configWithEcon = { ...engineConfig, economicsInputs }
   const initOpts = { multipliersByOwnerHex, spawnByOwnerHex }
   const { state, cfg } = initFromSeedV2(seedBytes, enginePlayers, configWithEcon, initOpts)
+
+  // Apply TP presets (tp_preset: 0=disabled, 1=safe, 2=balanced, 3=fierce, 4=yolo)
+  const presetNames = ['', 'safe', 'balanced', 'fierce', 'yolo']
+  const joinMap: Record<string, { tp?: { enabled: boolean; preset?: string } }> = {}
+  for (const p of players) {
+    if (p.tpPreset > 0 && p.tpPreset <= 4) {
+      joinMap[p.pubkeyHex] = { tp: { enabled: true, preset: presetNames[p.tpPreset] } }
+    }
+  }
+  applyTPPresetsToTargets(state as any, joinMap)
 
   const maxFrames = 72000
   let frame = 0
@@ -435,17 +458,36 @@ async function runSimulation(
     const result = advanceFrameV2(currentState, cfg)
     currentState = result.state
     frame++
-    if (verbose && frame % 6000 === 0) {
-      console.log(`  Frame ${frame}: ${countUniqueOwnersV2(currentState.orbs)} players remaining`)
+  }
+
+  // Log TP cashout events from economics
+  if (currentState.econ?.events) {
+    const tpEvents = currentState.econ.events.filter((e: any) => e.type === 'TPCashout')
+    if (tpEvents.length > 0) {
+      console.log(`  TP cashouts: ${tpEvents.length}`)
+      for (const e of tpEvents) {
+        console.log(`    frame=${e.frame} player=${(e as any).player_id?.slice(0,8)} amount=${((e as any).amount / 1e9).toFixed(4)} SOL`)
+      }
     }
   }
 
-  // Find winner
-  const remainingOwners = new Set<string>()
-  for (const o of currentState.orbs) {
-    remainingOwners.add(toHex(o.owner))
-  }
-  const winnerHex = remainingOwners.size === 1 ? Array.from(remainingOwners)[0] : null
+  // Determine winner using framesAlive ranking (matches production engine-runner)
+  // Sort by framesAlive desc, then kills desc, then roster index asc
+  const perPlayer = currentState.econ?.perPlayer || {}
+  const roster = currentState.econ?.roster || players.map((p: any) => p.pubkeyHex)
+  const ranked = Object.entries(perPlayer)
+    .map(([hex, data]: [string, any]) => ({
+      hex,
+      framesAlive: data.framesAlive || 0,
+      kills: data.kills || 0,
+      rosterIdx: roster.indexOf(hex),
+    }))
+    .sort((a, b) => {
+      if (b.framesAlive !== a.framesAlive) return b.framesAlive - a.framesAlive
+      if (b.kills !== a.kills) return b.kills - a.kills
+      return a.rosterIdx - b.rosterIdx
+    })
+  const winnerHex = ranked.length > 0 ? ranked[0].hex : null
 
   return { currentState, frame, winnerHex, countUniqueOwnersV2 }
 }
@@ -498,16 +540,14 @@ function buildSimulatedRankings(currentState: any, players: PlayerData[]): Ranki
     lostKills[ev.victim_id] = (lostKills[ev.victim_id] || 0) + victimKills
   }
 
-  // Build rankings
+  // Build rankings (use direct kills only to match on-chain)
   const simRankings: RankingEntry[] = []
   for (const [pubkeyHex, data] of Object.entries(perPlayer)) {
     const directKills = (data as any).kills || 0
-    const inherited = inheritedKills[pubkeyHex] || 0
-    const lost = lostKills[pubkeyHex] || 0
     simRankings.push({
       pubkeyHex,
       placement: 0,
-      kills: directKills + inherited - lost,
+      kills: directKills,
       framesAlive: (data as any).framesAlive || 0,
       deathFrame: (data as any).death_frame,
     })
@@ -666,6 +706,7 @@ async function main() {
     simInputs.economicsInputs,
     simInputs.multipliersByOwnerHex,
     simInputs.spawnByOwnerHex,
+    players,
     args.verbose
   )
 
