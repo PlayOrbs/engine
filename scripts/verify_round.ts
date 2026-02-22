@@ -291,8 +291,15 @@ async function main() {
     }
   })
   
-  // Sort by joinTs (roster order)
-  players.sort((a: any, b: any) => a.joinTs - b.joinTs)
+  // Sort by joinTs (roster order) with pubkey tiebreaker (matches orb-workers)
+  players.sort((a: any, b: any) => {
+    const joinDiff = a.joinTs - b.joinTs
+    if (joinDiff !== 0) return joinDiff
+    // Tiebreaker: base58 pubkey comparison
+    const aKey = hexToPubkey(a.pubkeyHex)
+    const bKey = hexToPubkey(b.pubkeyHex)
+    return aKey.localeCompare(bKey)
+  })
   
   console.log('\n📋 Roster (sorted by join time):')
   players.forEach((p: any, i: number) => {
@@ -326,7 +333,8 @@ async function main() {
       splitAggroMul: 1.0 + (p.allocSplit / 100),
       tetherResMul: 1.0, // deprecated, always 1.0
       tetherDefMul: 1.0 + (p.allocTether / 100),
-      powerMul: 1.0 + (p.allocPower / 100),
+      powerMul: 1.0, // deprecated, always 1.0
+      accelMul: 1.0 + (p.allocPower / 100),
     }
   }
   
