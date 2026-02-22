@@ -386,11 +386,13 @@ function applyMinSpeed(
   gCenterX: number, gCenterY: number,
 ): void {
   const speed = hypotVel(o.vx, o.vy)
-  // minSp = minSpeed * minSpeedMul * max(1, gravMul)
+  // minSp = minSpeed * minSpeedMul * accelMul * max(1, gravMul)
   let minSpCoef = o.trait.minSpeedMul
   if (dm.gravMul > FP_COEF) {
     minSpCoef = (minSpCoef * dm.gravMul) >> FP_COEF_SHIFT_N
   }
+  // Apply skill accelMul for faster acceleration
+  minSpCoef = (minSpCoef * o.skill.accelMul) >> FP_COEF_SHIFT_N
   const minSp = applyCoefVel(cfg.minSpeed, minSpCoef)
 
   if (speed < minSp) {
@@ -770,6 +772,7 @@ function applySplits(
       tetherResMul: parent.skill.tetherResMul,
       tetherDefMul: decayedDef > floorDef ? decayedDef : floorDef,
       powerMul: parent.skill.powerMul,
+      accelMul: parent.skill.accelMul,
     }
 
     const childCommon = {

@@ -27,6 +27,7 @@ function projectOrb(src: OrbV2, dst: Orb | undefined): Orb {
     tetherResMul: coefToFloat(src.skill.tetherResMul),
     tetherDefMul: coefToFloat(src.skill.tetherDefMul),
     powerMul: coefToFloat(src.skill.powerMul),
+    accelMul: coefToFloat(src.skill.accelMul),
   }
 
   const trait: Trait = {

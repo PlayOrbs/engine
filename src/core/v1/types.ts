@@ -21,7 +21,7 @@ export type PRNG = { nextU32: () => number; nextF32: () => number; derive: (info
  * - powerMul: Speed cap multiplier. Higher values allow faster maximum orb velocity,
  *   enabling more aggressive movement and harder-to-dodge attacks.
  */
-export type Skill = { splitAggroMul: number; tetherResMul: number; tetherDefMul: number; powerMul: number }
+export type Skill = { splitAggroMul: number; tetherResMul: number; tetherDefMul: number; powerMul: number; accelMul?: number }
 export type Orb = {
   x:number; y:number; vx:number; vy:number;
   justCollided:boolean; hadTether:boolean;

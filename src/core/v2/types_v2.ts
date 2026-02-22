@@ -34,6 +34,7 @@ export type SkillV2 = {
   tetherResMul: bigint   // FP_COEF (always FP_COEF = 1.0, deprecated)
   tetherDefMul: bigint   // FP_COEF
   powerMul: bigint       // FP_COEF
+  accelMul: bigint       // FP_COEF - acceleration boost multiplier
 }
 
 export const DEFAULT_SKILL_V2: SkillV2 = {
@@ -41,6 +42,7 @@ export const DEFAULT_SKILL_V2: SkillV2 = {
   tetherResMul: FP_COEF,
   tetherDefMul: FP_COEF,
   powerMul: FP_COEF,
+  accelMul: FP_COEF,
 }
 
 // ─── Orb V2 ───
@@ -309,5 +311,6 @@ export function convertSkillToV2(s: import('../v1/types.js').Skill): SkillV2 {
     tetherResMul: toCoef(s.tetherResMul),
     tetherDefMul: toCoef(s.tetherDefMul),
     powerMul: toCoef(s.powerMul),
+    accelMul: toCoef(s.accelMul ?? 1.0),
   }
 }
