@@ -591,12 +591,11 @@ function detectSplit(
   const keTh2_A = (cfg.keThreshold_vel2 << FP_COEF_SHIFT_N) / aggroA
   const keTh2_B = (cfg.keThreshold_vel2 << FP_COEF_SHIFT_N) / aggroB
 
-  // vn2 needs same scaling for comparison: vn2 << 40
-  const vn2_scaled = vn2 << FP_COEF_SHIFT_N
-  const sum_v2_scaled = sum_v2 << FP_COEF_SHIFT_N
-
-  const gateA = vn2_scaled >= vnTh2_A && sum_v2_scaled >= 2n * keTh2_A
-  const gateB = vn2_scaled >= vnTh2_B && sum_v2_scaled >= 2n * keTh2_B
+  // Compare vn2 directly against adjusted threshold (no extra scaling needed)
+  // vnTh2_A = (vnTh2_base << 40) / aggroA, so when aggroA=FP_COEF, vnTh2_A = vnTh2_base
+  // vn2 and vnTh2_base are both in FP_VEL² units, so compare directly
+  const gateA = vn2 >= vnTh2_A && sum_v2 >= 2n * keTh2_A
+  const gateB = vn2 >= vnTh2_B && sum_v2 >= 2n * keTh2_B
 
   const maxPending = cfg.maxOrbsCap - state.orbs.length - pendingSplitMap.size
   if (maxPending <= 0) return
