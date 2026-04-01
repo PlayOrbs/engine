@@ -119,6 +119,7 @@ export function initEconomicsFromConfig(state: EngineState, cfg: EngineConfig): 
   const economy_model = header.economy_model ?? 'weighted_kill_v2_inherit'
   const payout_model = header.payout_model ?? 'v1_inherit'
   const isV2 = payout_model === 'v2_top3'
+  console.debug(`[initEconomicsFromConfig] payout_model=${payout_model}, economy_model=${economy_model}, header.payout_model=${header.payout_model}`)
 
   let bounty_pot: number
   let survival_pot: number
@@ -145,8 +146,10 @@ export function initEconomicsFromConfig(state: EngineState, cfg: EngineConfig): 
     survival_pot = Math.trunc(player_pool * survival_share)
   } else {
     // weighted_kill_v2 and weighted_kill_v2_inherit: Log-weighted kill payouts with exact sum
-    const dev_fee_bps = isV2 ? 1500 : (header.dev_fee_bps ?? 2000)
+    // Use header.dev_fee_bps if provided, otherwise default based on payout model
+    const dev_fee_bps = header.dev_fee_bps ?? (isV2 ? 1500 : 2000)
     const dev_fee = dev_fee_bps / 10000
+    // Bounty/survival split based on payout model
     const bounty_share = isV2 ? 0.40 : 0.70
     const survival_share = isV2 ? 0.60 : 0.30
 
@@ -538,6 +541,7 @@ function finalizeGame(state: EngineState, winner_id: string): void {
 
   const payout_model = econ.header.payout_model ?? 'v1_inherit'
   const isV2 = payout_model === 'v2_top3'
+  console.log(`[finalizeGame] payout_model=${payout_model}, isV2=${isV2}, header=`, JSON.stringify(econ.header))
 
   if (isV2) {
     // v2_top3: Rank all players, distribute survival to top N
