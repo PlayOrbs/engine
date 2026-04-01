@@ -1,4 +1,22 @@
-// Bun Snapshot v1, https://goo.gl/fbAQLP
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`TP Presets - Engine Computation > Preset Snapshots > should produce stable preset values for N=8 > presets-n8-entry0.01 1`] = `
+{
+  "balanced": 33256698,
+  "fierce": 45879661,
+  "safe": 17645950,
+  "yolo": 50400000,
+}
+`;
+
+exports[`TP Presets - Engine Computation > Preset Snapshots > should produce stable preset values for N=16 > presets-n16-entry0.01 1`] = `
+{
+  "balanced": 33029464,
+  "fierce": 48416347,
+  "safe": 16854215,
+  "yolo": 62863213,
+}
+`;
 
 exports[`TP Presets - Engine Computation Preset Snapshots should produce stable preset values for N=8: presets-n8-entry0.01 1`] = `
 {

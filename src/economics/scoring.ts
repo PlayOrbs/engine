@@ -117,6 +117,8 @@ export function initEconomicsFromConfig(state: EngineState, cfg: EngineConfig): 
   const N = params.total_players
   const entry = params.entry_amount_lamports
   const economy_model = header.economy_model ?? 'weighted_kill_v2_inherit'
+  const payout_model = header.payout_model ?? 'v1_inherit'
+  const isV2 = payout_model === 'v2_top3'
 
   let bounty_pot: number
   let survival_pot: number
@@ -143,10 +145,10 @@ export function initEconomicsFromConfig(state: EngineState, cfg: EngineConfig): 
     survival_pot = Math.trunc(player_pool * survival_share)
   } else {
     // weighted_kill_v2 and weighted_kill_v2_inherit: Log-weighted kill payouts with exact sum
-    const dev_fee_bps = header.dev_fee_bps ?? 2000
+    const dev_fee_bps = isV2 ? 1500 : (header.dev_fee_bps ?? 2000)
     const dev_fee = dev_fee_bps / 10000
-    const bounty_share = 0.70
-    const survival_share = 0.30
+    const bounty_share = isV2 ? 0.40 : 0.70
+    const survival_share = isV2 ? 0.60 : 0.30
 
     const player_pool = Math.trunc(entry * N * (1 - dev_fee))
     bounty_pot = Math.trunc(player_pool * bounty_share)
@@ -220,9 +222,9 @@ export function initEconomicsFromConfig(state: EngineState, cfg: EngineConfig): 
     }
   }
 
-  // Build TP presets if we have a weighted schedule
+  // Build TP presets if we have a weighted schedule (v1 only)
   let tp_presets_lamports: Record<'safe' | 'balanced' | 'fierce' | 'yolo', number> | undefined
-  if (perKillSchedule) {
+  if (!isV2 && perKillSchedule) {
     tp_presets_lamports = buildTpPresetsLamports(perKillSchedule, N)
     if (cfg.debug) {
       console.log(`[Economics] TP Presets: safe=${(tp_presets_lamports.safe / 1e9).toFixed(3)} SOL, balanced=${(tp_presets_lamports.balanced / 1e9).toFixed(3)} SOL, fierce=${(tp_presets_lamports.fierce / 1e9).toFixed(3)} SOL, yolo=${(tp_presets_lamports.yolo / 1e9).toFixed(3)} SOL`)
@@ -248,14 +250,14 @@ export function initEconomicsFromConfig(state: EngineState, cfg: EngineConfig): 
     finalized: false,
     result_hash: undefined,
     prevOwners: [],
-    tp_presets_lamports,
-    tp_targets: econIn.tp_targets_lamports,
-    tp_triggered: new Set<string>()
+    tp_presets_lamports: isV2 ? undefined : tp_presets_lamports,
+    tp_targets: isV2 ? undefined : econIn.tp_targets_lamports,
+    tp_triggered: isV2 ? undefined : new Set<string>()
   }
 
   if (cfg.debug) {
     const tpCount = econIn.tp_targets_lamports ? Object.keys(econIn.tp_targets_lamports).length : 0
-    console.log(`[Economics] Initialized: model=${economy_model}, players=${N}, bounty=${(bounty_pot / 1e9).toFixed(3)} SOL, survival=${(survival_pot / 1e9).toFixed(3)} SOL, TP targets=${tpCount}`)
+    console.log(`[Economics] Initialized: model=${economy_model}, payout=${payout_model}, players=${N}, bounty=${(bounty_pot / 1e9).toFixed(3)} SOL, survival=${(survival_pot / 1e9).toFixed(3)} SOL, TP targets=${tpCount}`)
   }
 }
 
@@ -376,8 +378,9 @@ export function applyEconomicScoring(state: EngineState, frameEvents: any[], own
       currentAliveCount--
     }
 
-    // Step 2: Inheritance (weighted_kill_v2_inherit only)
-    if (econ.header.economy_model === 'weighted_kill_v2_inherit') {
+    // Step 2: Inheritance (v1_inherit payout model + weighted_kill_v2_inherit economy model only)
+    const payout_model = econ.header.payout_model ?? 'v1_inherit'
+    if (payout_model === 'v1_inherit' && econ.header.economy_model === 'weighted_kill_v2_inherit') {
       for (const victim_id of eliminated) {
         const killer_id = lastHit[victim_id]
         if (killer_id && killer_id !== victim_id) {
@@ -406,12 +409,13 @@ export function applyEconomicScoring(state: EngineState, frameEvents: any[], own
     }
   }
 
-  // Step 3: Check for TP triggers after bounty payouts and inheritance
-  if (econ.tp_targets && !econ.tp_triggered) {
+  // Step 3: Check for TP triggers after bounty payouts and inheritance (v1_inherit only)
+  const payout_model_tp = econ.header.payout_model ?? 'v1_inherit'
+  if (payout_model_tp === 'v1_inherit' && econ.tp_targets && !econ.tp_triggered) {
     econ.tp_triggered = new Set<string>()
   }
 
-  if (econ.tp_targets) {
+  if (payout_model_tp === 'v1_inherit' && econ.tp_targets) {
     // Build mapping of alive owners to their orb indices (post-prune)
     // Uses number[] to handle split orbs (multiple orbs per owner)
     const ownerToIndices: Record<string, number[]> = {}
@@ -505,30 +509,100 @@ export function applyEconomicScoring(state: EngineState, frameEvents: any[], own
 }
 
 /**
+ * Rank all players by: framesAlive (desc), kills (desc), rosterIndex (asc).
+ * Returns array of player hex IDs in placement order (index 0 = 1st place).
+ */
+function rankPlayers(econ: NonNullable<EngineState['econ']>): string[] {
+  return [...econ.roster].sort((a, b) => {
+    const pa = econ.perPlayer[a]
+    const pb = econ.perPlayer[b]
+    if (!pa || !pb) return 0
+    // framesAlive desc
+    if (pb.framesAlive !== pa.framesAlive) return pb.framesAlive - pa.framesAlive
+    // kills desc
+    if (pb.kills !== pa.kills) return pb.kills - pa.kills
+    // rosterIndex asc
+    return (econ.rosterIndex[a] ?? 0) - (econ.rosterIndex[b] ?? 0)
+  })
+}
+
+/**
  * Finalize game with the given winner.
- * Awards survival pot + any remaining bounty to winner.
+ * v1_inherit: Awards survival pot + remaining bounty to winner (winner-takes-all).
+ * v2_top3: Awards survival pot to top 2-3 by placement, remaining bounty to 1st.
  * This is the single source of truth for game finalization.
  */
 function finalizeGame(state: EngineState, winner_id: string): void {
   const econ = state.econ
   if (!econ || econ.finalized) return
 
-  // Award survival pot + any remaining bounty to winner
-  const survivalAward = econ.pots?.survival_pot_lamports || 0
-  const remainingBounty = econ.bounty_remaining || 0
-  const totalAward = survivalAward + remainingBounty
-  
-  const wp = econ.perPlayer?.[winner_id]
-  if (wp) {
-    wp.survival_earned = (wp.survival_earned || 0) + totalAward
-    wp.total_earned = (wp.bounty_earned || 0) + wp.survival_earned
+  const payout_model = econ.header.payout_model ?? 'v1_inherit'
+  const isV2 = payout_model === 'v2_top3'
+
+  if (isV2) {
+    // v2_top3: Rank all players, distribute survival to top N
+    const ranked = rankPlayers(econ)
+    const N = econ.roster.length
+    const survivalPot = econ.pots?.survival_pot_lamports || 0
+    const remainingBounty = econ.bounty_remaining || 0
+
+    // Determine survival split based on lobby size
+    const splits = N < 4
+      ? [0.70, 0.30]           // Top 2
+      : [0.65, 0.25, 0.10]    // Top 3
+
+    // Award survival to top placed players
+    let survivalAwarded = 0
+    for (let i = 0; i < splits.length && i < ranked.length; i++) {
+      const playerId = ranked[i]
+      const player = econ.perPlayer[playerId]
+      if (!player) continue
+      const award = Math.trunc(survivalPot * splits[i])
+      player.survival_earned = (player.survival_earned || 0) + award
+      player.total_earned = (player.bounty_earned || 0) + player.survival_earned
+      player.placement = i + 1
+      survivalAwarded += award
+      econ.events.push({
+        type: 'SurvivalAward',
+        frame: state.frame,
+        winner_id: playerId,
+        amount: award
+      })
+    }
+
+    // Assign placement to remaining players
+    for (let i = splits.length; i < ranked.length; i++) {
+      const player = econ.perPlayer[ranked[i]]
+      if (player) player.placement = i + 1
+    }
+
+    // Remaining bounty goes to 1st place
+    if (remainingBounty > 0 && ranked.length > 0) {
+      const first = econ.perPlayer[ranked[0]]
+      if (first) {
+        first.bounty_earned += remainingBounty
+        first.total_earned = (first.bounty_earned || 0) + (first.survival_earned || 0)
+      }
+    }
+    econ.bounty_remaining = 0
+    econ.winner_id = ranked[0] ?? winner_id
+  } else {
+    // v1_inherit: Winner takes all survival + remaining bounty
+    const survivalAward = econ.pots?.survival_pot_lamports || 0
+    const remainingBounty = econ.bounty_remaining || 0
+    const totalAward = survivalAward + remainingBounty
+
+    const wp = econ.perPlayer?.[winner_id]
+    if (wp) {
+      wp.survival_earned = (wp.survival_earned || 0) + totalAward
+      wp.total_earned = (wp.bounty_earned || 0) + wp.survival_earned
+    }
+
+    econ.bounty_remaining = 0
+    econ.events.push({ type: 'SurvivalAward', frame: state.frame, winner_id, amount: totalAward })
+    econ.winner_id = winner_id
   }
-  
-  // Clear remaining bounty since it's been awarded
-  econ.bounty_remaining = 0
-  
-  econ.events.push({ type: 'SurvivalAward', frame: state.frame, winner_id, amount: totalAward })
-  econ.winner_id = winner_id
+
   econ.finalized = true
   econ.result_hash = computeResultHash(state)
 }

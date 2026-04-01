@@ -120,7 +120,7 @@ export type EngineConfig = {
     tetherDimAlpha: number
   }
   economicsInputs?: {
-    header: { round_id:number; seed_hex:string; map_id:string; rules_hash:string; build_hash:string; mode?: 'paid' | 'free_sim'; economy_model?: 'fixed_total_v0' | 'log_scaled_kill_v1' | 'weighted_kill_v2' | 'weighted_kill_v2_inherit'; dev_fee_bps?: number }
+    header: { round_id:number; seed_hex:string; map_id:string; rules_hash:string; build_hash:string; mode?: 'paid' | 'free_sim'; economy_model?: 'fixed_total_v0' | 'log_scaled_kill_v1' | 'weighted_kill_v2' | 'weighted_kill_v2_inherit'; dev_fee_bps?: number; payout_model?: 'v1_inherit' | 'v2_top3' }
     economic_params: { total_players:number; entry_amount_lamports:number; bounty_bps:number; survival_bps:number; simulated?: boolean }
     roster: string[]
     tp_targets_lamports?: Record<string, number>
@@ -148,7 +148,7 @@ export type EngineState = {
   // Deterministic economic scoring (optional)
   econ?: {
     // Inputs
-    header: { round_id:number; seed_hex:string; map_id:string; rules_hash:string; build_hash:string; mode?: 'paid' | 'free_sim'; economy_model?: 'fixed_total_v0' | 'log_scaled_kill_v1' | 'weighted_kill_v2' | 'weighted_kill_v2_inherit'; dev_fee_bps?: number }
+    header: { round_id:number; seed_hex:string; map_id:string; rules_hash:string; build_hash:string; mode?: 'paid' | 'free_sim'; economy_model?: 'fixed_total_v0' | 'log_scaled_kill_v1' | 'weighted_kill_v2' | 'weighted_kill_v2_inherit'; dev_fee_bps?: number; payout_model?: 'v1_inherit' | 'v2_top3' }
     economic_params: { total_players:number; entry_amount_lamports:number; bounty_bps:number; survival_bps:number; simulated?: boolean }
     roster: string[] // full 64-hex player ids, lexicographically sorted
     rosterIndex: Record<string, number>
@@ -159,7 +159,7 @@ export type EngineState = {
     perKillSchedule?: Record<number, number> // A -> payout lamports
     weights_meta?: { model:string; dev_fee_bps:number; bounty_share_bps:number; survival_share_bps:number }
     // Per-player tallies (by player_id hex)
-    perPlayer: Record<string, { kills:number; framesAlive:number; spawn_frame:number; last_alive_frame:number; death_frame?: number; bounty_earned:number; survival_earned:number; total_earned:number; cashed_bounty?:number }>
+    perPlayer: Record<string, { kills:number; framesAlive:number; spawn_frame:number; last_alive_frame:number; death_frame?: number; bounty_earned:number; survival_earned:number; total_earned:number; cashed_bounty?:number; placement?:number }>
     prevOwners?: string[]
     // Take Profit (TP) tracking
     tp_presets_lamports?: Record<'safe' | 'balanced' | 'fierce' | 'yolo', number>
