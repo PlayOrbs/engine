@@ -342,7 +342,7 @@ function buildPlayers(playerConfigs: any[], snapshot: any): PlayerData[] {
 }
 
 // ─── STEP 4: Build Simulation Inputs ──────────────────────────────────────────
-function buildSimulationInputs(players: PlayerData[], engineConfig: any, args: Args, seedHex: string, configVersion: string) {
+function buildSimulationInputs(players: PlayerData[], engineConfig: any, args: Args, seedHex: string, configVersion: string, snapshot: any) {
   // Skill multipliers (diminishing returns curve)
   const skillCurve = { a: 0.5, k: 0.5 }
   const calcMul = (points: number) => 1 + skillCurve.a * (1 - Math.exp(-skillCurve.k * points))
@@ -379,7 +379,18 @@ function buildSimulationInputs(players: PlayerData[], engineConfig: any, args: A
     }
   }
 
-  // Economics inputs
+  // Economics inputs — must match engine-runner production values
+  // Derive entry fee from on-chain total payouts:
+  //   total_payout = entry * N * (1 - dev_fee_bps / 10000)
+  //   entry = total_payout / (N * (1 - dev_fee_bps / 10000))
+  const DEV_FEE_BPS = 1500
+  const totalPayoutLamports = snapshot.players.reduce(
+    (sum: number, p: any) => sum + Number(p.payout_lamports), 0
+  )
+  const entryAmountLamports = Math.round(
+    totalPayoutLamports / (players.length * (1 - DEV_FEE_BPS / 10000))
+  )
+
   const roster = players.map(p => p.pubkeyHex)
   const economicsInputs = {
     header: {
@@ -389,14 +400,15 @@ function buildSimulationInputs(players: PlayerData[], engineConfig: any, args: A
       rules_hash: 'verify',
       build_hash: 'verify',
       mode: 'paid' as const,
-      economy_model: 'weighted_kill_v2_inherit' as const,
-      dev_fee_bps: 0,
+      economy_model: 'weighted_kill_v2' as const,
+      dev_fee_bps: DEV_FEE_BPS,
+      payout_model: 'v2_top3' as const,
     },
     economic_params: {
       total_players: players.length,
-      entry_amount_lamports: 8_000_000,
-      bounty_bps: 7000,
-      survival_bps: 3000,
+      entry_amount_lamports: entryAmountLamports,
+      bounty_bps: 4000,
+      survival_bps: 6000,
     },
     roster,
   }
@@ -692,7 +704,7 @@ async function main() {
 
   // Step 4: Build simulation inputs
   console.log('\n⚙️  Running simulation...')
-  const simInputs = buildSimulationInputs(players, roundData.engineConfig, args, roundData.seedHex, roundData.configVersion)
+  const simInputs = buildSimulationInputs(players, roundData.engineConfig, args, roundData.seedHex, roundData.configVersion, roundData.snapshot)
 
   if (args.verbose) {
     console.log('  Skill multipliers:', JSON.stringify(simInputs.multipliersByOwnerHex, null, 2))
